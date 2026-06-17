@@ -1,33 +1,13 @@
 /**
- * @fileoverview Manual-test entry points for use from the Apps Script IDE.
+ * @fileoverview Manual-test entry points for the Apps Script IDE.
  *
- * Each function in this file is a small, side-effecting test designed to
- * be run interactively from the Apps Script editor's "Select function"
- * dropdown. They are NOT called by the pipeline and are NOT bound to
- * any trigger.
+ * Each function is a small, side-effecting test designed to be run from the
+ * editor's "Select function" dropdown. Not called by the pipeline.
  *
- * Suggested run order for a fresh deployment (per docs/ProjectStatusReport.md
- * §7 "Recommended Next Steps"):
- *
- *   1. testLogCreation()    — verify the log sheet is auto-created with
- *                             the correct headers and that a single
- *                             INTERN + RUN_SUMMARY row pair can be
- *                             written and flushed.
- *   2. testTriggerInstall() — verify the time-driven trigger can be
- *                             installed idempotently and is visible in
- *                             the project trigger list.
- *   3. runSampleDryRun()    — exercise the full pipeline in dry-run
- *                             mode against the live Timeline snapshot.
- *                             No Drive permission is mutated; the log
- *                             sheet should fill with DRY_RUN rows.
- *
- * Public functions:
- *   - runSampleDryRun()
- *   - testLogCreation()
- *   - testTriggerInstall()
- *
- * Dependencies: config.gs (LOG_SHEET_NAME, DRY_RUN), and all service
- *               modules reached transitively through the pipeline.
+ * Suggested order for a fresh deployment:
+ *   1. testLogCreation()    — verify log sheet auto-create + row write/flush.
+ *   2. testTriggerInstall() — verify trigger install is idempotent.
+ *   3. runSampleDryRun()    — exercise the full pipeline in dry-run mode.
  */
 
 // =============================================================================
@@ -35,19 +15,16 @@
 // =============================================================================
 
 /**
- * Runs the full revocation pipeline in dry-run mode against the
- * current Timeline snapshot. Produces complete logs in the
- * AccessRevocationLog sheet but performs NO Drive mutations.
+ * Runs the full pipeline in dry-run against the current Timeline snapshot.
+ * Produces complete logs but performs NO Drive mutations.
  *
- * Use this as the smoke test after any change to sheetService or
- * driveService. After running, open the log sheet and verify:
+ * After running, verify in the log sheet:
  *   - One INTERN row per ELIGIBLE candidate.
- *   - The ACTION column reads 'DRY_RUN' for every intern row.
- *   - The MESSAGE column distinguishes "would have removed" from
- *     "no permission found".
- *   - The final RUN_SUMMARY row has counts matching the INTERN rows.
+ *   - ACTION column reads 'DRY_RUN' for every intern row.
+ *   - MESSAGE distinguishes "would have removed" from "no permission found".
+ *   - RUN_SUMMARY row counts match the INTERN rows.
  *
- * @returns {Object} The summary object produced by runRevocationPipelineDry().
+ * @returns {Object} The summary from runRevocationPipelineDry().
  */
 function runSampleDryRun() {
   Logger.log('runSampleDryRun: starting dry-run pipeline...');
@@ -58,13 +35,9 @@ function runSampleDryRun() {
 }
 
 /**
- * Verifies that logService can create (or open) the log sheet and
- * write a single INTERN + RUN_SUMMARY row pair. Does NOT call
- * driveService or sheetService's read path.
- *
- * Safe to run repeatedly: each invocation appends two rows to the
- * log sheet.
- *
+ * Verifies logService can create/open the log sheet and write one
+ * INTERN + RUN_SUMMARY row pair. Does NOT touch driveService or sheetService reads.
+ * Safe to run repeatedly (appends two rows each time).
  * @returns {{written: number, runId: string}}
  */
 function testLogCreation() {
@@ -98,11 +71,8 @@ function testLogCreation() {
 }
 
 /**
- * Verifies that the time-driven trigger can be installed
- * idempotently, then lists every currently-registered project
- * trigger. Does NOT uninstall — call uninstallTrigger() separately
- * to remove.
- *
+ * Verifies the trigger installs idempotently and lists current project triggers.
+ * Does NOT uninstall — call uninstallTrigger() separately to remove.
  * @returns {{
  *   installed: boolean,
  *   existingTriggerId: ?string,

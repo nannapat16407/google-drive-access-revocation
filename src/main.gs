@@ -1,38 +1,22 @@
 /**
  * @fileoverview Main controller. Orchestrates a single revocation run.
  *
- * Responsibility:
- *   - Compose the services (sheetService -> driveService -> logService) into
- *     a coherent pipeline:
- *         1. Load the dynamic exception allowlist (supervisor emails
- *            from the Supervisor sheet, merged with the static
- *            EXCEPTION_EMAILS list from config.gs).
- *         2. Publish the allowlist to driveService so revokeAccess can
- *            enforce it (NFR-S2).
- *         3. Start a log run.
- *         4. Read intern records from the source sheet.
- *         5. Filter to the ELIGIBLE candidate set.
- *         6. For each candidate (per-item try/catch), call
- *            revokeAccess and record the result.
- *         7. End the log run with aggregated counts.
- *         8. Flush the log buffer to the log sheet.
- *   - Centralise error handling so a failure on one intern does not
- *     abort the run (FR-08 Layer 1). Source-sheet failures abort
- *     cleanly with an abort-level summary row (FR-08 Layer 2).
- *   - Honour the DRY_RUN flag from config.gs, with an override hook
- *     used by runRevocationPipelineDry().
+ * Pipeline:
+ *   1. Load + merge exception allowlist (static + supervisor).
+ *   2. Publish allowlist to driveService (NFR-S2).
+ *   3. Start a log run.
+ *   4. Read intern records from the source sheet.
+ *   5. Filter to ELIGIBLE candidates.
+ *   6. For each candidate, call revokeAccess and record the result.
+ *   7. End log run with aggregated counts.
+ *   8. Flush the log buffer.
+ *
+ * Per-intern failures never abort the run (FR-08 Layer 1). Source-sheet
+ * failures abort cleanly with an abort-level summary row (FR-08 Layer 2).
  *
  * Public functions:
  *   - runRevocationPipeline(triggerSource?, opts?)  -> RunSummary
  *   - runRevocationPipelineDry()                    -> RunSummary
- *
- * Dependencies: config.gs, sheetService.gs, driveService.gs, logService.gs
- *
- * Apps Script scope note: every `.gs` file in this project shares a
- * single global scope, so functions defined in other modules are
- * called here by their bare name (e.g. `revokeAccess(...)`, not
- * `driveService.revokeAccess(...)`). The `module.function` notation
- * in docs/SystemDesign.md is illustrative only.
  */
 
 // =============================================================================
@@ -40,12 +24,8 @@
 // =============================================================================
 
 /**
- * Trigger-source labels recorded against each run. Kept here (not in
- * config.gs) because they are an internal implementation detail of
- * the pipeline, not an operator-tunable value.
- *
- * `DRY_RUN_MANUAL` is a distinct label so dry-run rows can be
- * filtered out of routine operator reviews.
+ * Trigger-source labels recorded against each run.
+ * `DRY_RUN_MANUAL` is distinct so dry-run rows can be filtered out.
  * @enum {string}
  */
 const TRIGGER_SOURCE = {
@@ -60,29 +40,12 @@ const TRIGGER_SOURCE = {
 // =============================================================================
 
 /**
- * Runs the full revocation pipeline using the current DRY_RUN flag in
- * config.gs (unless overridden via opts.dryRunOverride).
+ * Runs the full revocation pipeline using DRY_RUN (unless overridden).
  *
- * Flow:
- *   1. Load + merge the exception allowlist (static + supervisor).
- *   2. Publish the merged list to driveService.
- *   3. Start a log run.
- *   4. Read candidates from the source sheet (throws on failure).
- *   5. For each candidate: try { revokeAccess + record result }.
- *   6. End + flush the log run.
- *
- * Per-intern failures NEVER abort the run (FR-08 Layer 1). A
- * source-sheet failure (workbook unopenable, schema missing) aborts
- * after writing an abort-level summary row (FR-08 Layer 2).
- *
- * @param {string=} triggerSource
- *     One of TRIGGER_SOURCE. Defaults to MANUAL.
- * @param {{dryRunOverride: ?boolean}=} opts
- *     When present, overrides the global DRY_RUN flag for this run
- *     only. Used by runRevocationPipelineDry().
- * @returns {Object} RunSummary. The same shape is returned for
- *     successful runs and for aborts; aborts additionally carry
- *     `aborted: true`, `abortReason`, and `abortError`.
+ * @param {string=} triggerSource - One of TRIGGER_SOURCE. Defaults to MANUAL.
+ * @param {{dryRunOverride: ?boolean}=} opts - Overrides DRY_RUN for this run.
+ * @returns {Object} RunSummary. Aborts additionally carry `aborted: true`,
+ *     `abortReason`, and `abortError`.
  */
 function runRevocationPipeline(triggerSource, opts) {
   opts = opts || {};
@@ -91,11 +54,10 @@ function runRevocationPipeline(triggerSource, opts) {
     : Boolean(opts.dryRunOverride);
   const source = triggerSource || TRIGGER_SOURCE.MANUAL;
 
-  // 1. Load the dynamic exception allowlist (supervisor emails from
-  //    the Supervisor sheet, merged with the static EXCEPTION_EMAILS).
+  // 1. Load + merge exception allowlist.
   const exceptionEmails = _loadExceptionEmails_();
 
-  // 2. Publish to driveService so revokeAccess enforces the list.
+  // 2. Publish to driveService.
   setExceptionEmails(exceptionEmails);
 
   // 3. Start log run.
@@ -127,13 +89,12 @@ function runRevocationPipeline(triggerSource, opts) {
       });
       _recordResult_(rec, result);
       _bumpCounters_(counters, result);
+      _maybeWriteTrackingStatus_(rec, result, dryRun);
     } catch (e) {
-      // revokeAccess is designed to never throw (it returns
-      // DRIVE_API_ERROR / FOLDER_NOT_ACCESSIBLE on failure). If it
-      // does throw, we log and continue so one bad row cannot abort
-      // the rest of the run.
+      // revokeAccess is designed not to throw. If it does, log and continue.
       _recordFailure_(rec, e);
       counters.failed++;
+      _maybeWriteTrackingStatus_(rec, { outcome: 'failure' }, dryRun);
     }
   }
 
@@ -164,11 +125,7 @@ function runRevocationPipeline(triggerSource, opts) {
 }
 
 /**
- * Convenience wrapper that forces dry-run mode regardless of DRY_RUN
- * in config.gs. Use from the Apps Script IDE or from integration
- * helpers to preview the candidate set without mutating any Drive
- * permission.
- *
+ * Convenience wrapper forcing dry-run regardless of config.
  * @returns {Object} See runRevocationPipeline.
  */
 function runRevocationPipelineDry() {
@@ -180,14 +137,8 @@ function runRevocationPipelineDry() {
 // =============================================================================
 
 /**
- * Loads the dynamic exception allowlist. Combines:
- *   - The static EXCEPTION_EMAILS list from config.gs.
- *   - The supervisor emails read from the Supervisor sheet.
- *
- * Supervisor loading is best-effort: if readSupervisorEmails() throws
- * or returns nothing, the static list alone is used. The pipeline
- * never aborts solely because the Supervisor sheet was unreachable.
- *
+ * Loads the merged exception allowlist (static EXCEPTION_EMAILS + supervisor emails).
+ * Supervisor loading is best-effort; never aborts on supervisor failure.
  * @returns {string[]} Canonicalised (trim + lowercase), deduplicated.
  * @private
  */
@@ -196,7 +147,6 @@ function _loadExceptionEmails_() {
   try {
     supervisors = readSupervisorEmails();
   } catch (e) {
-    // readSupervisorEmails already swallows everything, but
     // belt-and-braces: an exception here must never block the run.
     supervisors = [];
   }
@@ -224,7 +174,6 @@ function _loadExceptionEmails_() {
 
 /**
  * Records a successful driveService result on the intern's log row.
- *
  * @param {Object} rec - The InternRecord (from getEligibleCandidates).
  * @param {Object} result - The RevocationResult returned by revokeAccess.
  * @private
@@ -242,14 +191,8 @@ function _recordResult_(rec, result) {
 }
 
 /**
- * Records an unexpected exception (not a normal RevocationResult) on
- * the intern's log row.
- *
- * Action code is 'DRIVE_API_ERROR' because that is the closest match
- * in the controlled vocabulary (docs/DataDictionary.md §4.7) and the
- * exception happened inside the per-intern Drive cycle. The message
- * carries the raw exception text so an operator can diagnose.
- *
+ * Records an unexpected exception on the intern's log row.
+ * Action code is 'DRIVE_API_ERROR' (closest controlled-vocabulary match).
  * @param {Object} rec
  * @param {*} error
  * @private
@@ -275,18 +218,12 @@ function _recordFailure_(rec, error) {
 
 /**
  * Increments the appropriate counter based on a RevocationResult.
- *
  * Bucketing rules:
- *   - outcome === 'failure'                  -> failed (always wins)
- *   - action === 'REVOKED'                   -> revoked
- *   - action in {ALREADY_REVOKED,
- *                ALREADY_REVOKED_PROVISIONED}-> alreadyRevoked
- *   - action === 'SKIPPED_EXCEPTION_USER'    -> skipped
- *   - action === 'DRY_RUN'                   -> skipped
- *        (Per-intern log rows carry the distinguishing message;
- *         the summary does not subdivide dry-run outcomes.)
- *   - any other action                       -> skipped (defensive)
- *
+ *   - outcome === 'failure'                          -> failed
+ *   - action === 'REVOKED'                           -> revoked
+ *   - action in {ALREADY_REVOKED, ALREADY_REVOKED_PROVISIONED} -> alreadyRevoked
+ *   - action in {SKIPPED_EXCEPTION_USER, DRY_RUN}    -> skipped
+ *   - any other action                               -> skipped (defensive)
  * @param {Object} counters - Mutated in place.
  * @param {Object} result
  * @private
@@ -309,22 +246,78 @@ function _bumpCounters_(counters, result) {
       counters.skipped++;
       return;
     default:
-      // Unknown action — defensive. The per-intern log row still
-      // carries the raw action text for diagnosis.
+      // Unknown action — defensive. Raw action still logged per-intern.
       counters.skipped++;
   }
 }
 
 /**
- * Ends the run with a failure summary. Used when the source sheet
- * cannot be read and the pipeline cannot proceed.
+ * Maps a RevocationResult to the TRACKING STATUS value to write back, or null.
  *
- * Always emits a RUN_SUMMARY row and flushes it, so even an abort
- * leaves an auditable trace. The flush itself is wrapped in a
- * try/catch: if the workbook is so badly unreachable that the log
- * sheet cannot be written either, we still return the abort summary
- * (with `flushError` set) rather than throwing — the caller already
- * has an error to deal with.
+ * Decision matrix:
+ *   - dry-run OR action === 'DRY_RUN'                -> null
+ *   - action === 'SKIPPED_EXCEPTION_USER'            -> null (don't mislabel)
+ *   - outcome === 'failure'                          -> 'Revocation Failed'
+ *   - action in {REVOKED, ALREADY_REVOKED[_PROVISIONED]} -> 'Access Revoked'
+ *   - any other action                               -> null
+ *
+ * ALREADY_REVOKED[_PROVISIONED] maps to 'Access Revoked' because the desired
+ * end-state (no access) has been reached. SKIPPED_EXCEPTION_USER is left
+ * unchanged because the allowlist is a safety net, not a state transition.
+ *
+ * @param {Object} result - The RevocationResult, or `{ outcome: 'failure' }`.
+ * @param {boolean} dryRun - The run-level dry-run flag.
+ * @returns {?string} TRACKING_STATUS_ACCESS_REVOKED, TRACKING_STATUS_REVOCATION_FAILED, or null.
+ * @private
+ */
+function _computeNewTrackingStatus_(result, dryRun) {
+  if (dryRun) return null;
+  if (result.action === 'DRY_RUN') return null;
+  if (result.action === 'SKIPPED_EXCEPTION_USER') return null;
+  if (result.outcome === 'failure') return TRACKING_STATUS_REVOCATION_FAILED;
+  switch (result.action) {
+    case 'REVOKED':
+    case 'ALREADY_REVOKED':
+    case 'ALREADY_REVOKED_PROVISIONED':
+      return TRACKING_STATUS_ACCESS_REVOKED;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Writes the new TRACKING STATUS for an intern if warranted.
+ * Write-back failure is logged but never aborts the run (audit trail is in the
+ * per-intern log row, separate from the Timeline cell).
+ *
+ * @param {Object} rec - The InternRecord (needs `rowNumber`).
+ * @param {Object} result - The RevocationResult or `{ outcome: 'failure' }`.
+ * @param {boolean} dryRun - The run-level dry-run flag.
+ * @private
+ */
+function _maybeWriteTrackingStatus_(rec, result, dryRun) {
+  const newStatus = _computeNewTrackingStatus_(result, dryRun);
+  if (newStatus === null) return;
+
+  try {
+    updateTrackingStatus(rec.rowNumber, newStatus);
+  } catch (e) {
+    // Don't abort the run. The Drive outcome is already logged; operator can
+    // reconcile Timeline manually using the log sheet.
+    const msg = (e && typeof e === 'object' && e.message) ? e.message : String(e);
+    Logger.log(
+      'Warning: write-back failed for row ' + rec.rowNumber +
+      ' (intended status "' + newStatus + '"): ' + msg
+    );
+  }
+}
+
+/**
+ * Ends the run with a failure summary when the source sheet cannot be read.
+ *
+ * Always emits a RUN_SUMMARY row and flushes it. The flush is wrapped in
+ * try/catch: if the log sheet is also unreachable, the abort summary is still
+ * returned (with `flushError` set) rather than throwing.
  *
  * @param {Object} ctx - The run context returned by startRun.
  * @param {string} reason - Short reason code (e.g. 'READ_FAILED').
@@ -348,9 +341,7 @@ function _abortRun_(ctx, reason, error) {
     });
     flush();
   } catch (e) {
-    // The workbook is likely unreachable (same workbook as the
-    // source sheet that just failed). Surface the secondary error
-    // on the returned summary; do not throw.
+    // Workbook likely unreachable. Surface secondary error; do not throw.
     flushError = (e && typeof e === 'object' && e.message)
       ? e.message
       : String(e);

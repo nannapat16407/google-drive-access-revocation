@@ -1,34 +1,24 @@
 /**
- * @fileoverview Centralised configuration for the Google Drive Access
- * Revocation system.
+ * @fileoverview Central config for the Drive access revocation system.
  *
- * This file is the single source of truth for every tunable parameter.
- * Business logic in other modules MUST NOT hard-code IDs, schedules,
- * thresholds, or column letters — it reads them from here.
- *
- * Operators can change behaviour (point at a different workbook, flip
- * dry-run mode, adjust the grace period, add an exception user) by
- * editing this file alone, with no logic changes elsewhere.
- *
- * Confirmed assumptions for this revision (from project supervisor):
- *   - Source sheet          : Timeline
- *   - Permission type       : Direct Share (by email)
- *   - Folder scope          : Main folder only (no recursive walk)
- *   - Email notifications   : None
- *   - Trigger cadence       : Daily
+ * Confirmed assumptions:
+ *   - Source sheet    : Timeline
+ *   - Permission type : Direct Share (by email)
+ *   - Folder scope    : Main folder only (no recursive walk)
+ *   - Email notifications : None
+ *   - Trigger cadence : Daily
  *
  * Sections:
  *   1. Workbook identity
  *   2. Sheet names
- *   3. Column mapping (spreadsheet header  ->  internal field)
+ *   3. Column mapping
  *   4. Status enums
- *   5. Validation constants (regexes, prefixes)
+ *   5. Validation constants
  *   6. Date handling
- *   7. Error codes (controlled vocabulary — log-sheet filter keys)
+ *   7. Error codes
  *   8. Eligibility enum
  *   9. Operational parameters
- *  10. Trigger schedule (constants only; triggerService.gs is not yet
- *      implemented)
+ *  10. Trigger schedule
  */
 
 // =============================================================================
@@ -36,8 +26,7 @@
 // =============================================================================
 
 /**
- * Google Sheets file ID of the production workbook. Extracted from the
- * sheet's URL:  https://docs.google.com/spreadsheets/d/<ID>/edit
+ * Google Sheets ID for production workbook.
  * @type {string}
  */
 const SPREADSHEET_ID = '1AOjCbe6WL41I-jUa7R762Y4D-5AAc3VnIfM7qrsmAkU';
@@ -47,19 +36,13 @@ const SPREADSHEET_ID = '1AOjCbe6WL41I-jUa7R762Y4D-5AAc3VnIfM7qrsmAkU';
 // =============================================================================
 
 /**
- * Name of the sheet treated as the source of truth for internship records.
- * Per confirmed assumption: `Timeline`.
- *
- * Do not change without also updating COLUMN_MAPPING below and re-running
- * the schema check performed by sheetService._buildColumnIndex_().
+ * Source-of-truth sheet for internship records.
  * @type {string}
  */
 const SOURCE_SHEET_NAME = 'Timeline';
 
 /**
- * Name of the sheet used for execution logs (one row per intern per run,
- * plus one summary row per run). The sheet is created lazily by the
- * log service (not yet implemented) if it does not exist.
+ * Sheet for execution logs. Created lazily if missing.
  * @type {string}
  */
 const LOG_SHEET_NAME = 'AccessRevocationLog';
@@ -69,16 +52,10 @@ const LOG_SHEET_NAME = 'AccessRevocationLog';
 // =============================================================================
 
 /**
- * Maps each internal field name to its spreadsheet column.
- *
- *   - `header`   : exact text expected in row 1 of the sheet.
- *   - `column`   : column letter, used as a fallback if `header` lookup
- *                  fails AND as documentation of expected position.
- *   - `required` : whether the revocation pipeline needs this field
- *                  populated to consider the row for processing.
- *
- * Keep this in sync with docs/DataDictionary.md §1 and §2. Any change
- * here is a schema change and should be reflected in the docs.
+ * Maps internal field names to spreadsheet columns.
+ *   - `header`   : row-1 text to match.
+ *   - `column`   : fallback letter / position doc.
+ *   - `required` : whether the pipeline requires this field.
  * @type {Object<string, {header: string, column: string, required: boolean}>}
  */
 const COLUMN_MAPPING = {
@@ -104,42 +81,37 @@ const COLUMN_MAPPING = {
 // =============================================================================
 
 /**
- * INTERNSHIP STATUS values that mark an intern as offboarded and
- * therefore potentially eligible for revocation (subject to the date
- * and grace-period checks). See docs/DataDictionary.md §1.11.
+ * INTERNSHIP STATUS values marking an intern as offboarded (potentially eligible).
  * @type {string[]}
  */
 const STATUS_OFFBOARDED = ['Completed', 'Withdraw'];
 
 /**
- * INTERNSHIP STATUS values that mark an intern as still active. These
- * records are never revoked, regardless of end date.
+ * INTERNSHIP STATUS values marking an intern as active. Never revoked.
  * @type {string[]}
  */
 const STATUS_ACTIVE = ['Interning', 'Pending'];
 
 /**
- * Allowed values for the INTERNSHIP STATUS column. Union of the two
- * sets above. Used by sheetService for enum validation.
+ * Allowed INTERNSHIP STATUS values (union of offboarded + active).
  * @type {string[]}
  */
 const ALLOWED_INTERNSHIP_STATUSES = STATUS_OFFBOARDED.concat(STATUS_ACTIVE);
 
 /**
- * Allowed values for the WORKMODE column. Unknown values are passed
- * through unchanged and logged at WARN, not rejected.
+ * Allowed WORKMODE values. Unknown values pass through with a WARN.
  * @type {string[]}
  */
 const ALLOWED_WORKMODES = ['Hybrid', 'WFO', 'WFH'];
 
 /**
- * Allowed values for the TRACKING STATUS column. Empty is also valid.
+ * Allowed TRACKING STATUS values. Empty is also valid.
  * @type {string[]}
  */
 const ALLOWED_TRACKING_STATUSES = ['Access Shared'];
 
 /**
- * Allowed values for the EMAIL STATUS column. Empty is also valid.
+ * Allowed EMAIL STATUS values. Empty is also valid.
  * @type {string[]}
  */
 const ALLOWED_EMAIL_STATUSES = ['Success'];
@@ -149,31 +121,20 @@ const ALLOWED_EMAIL_STATUSES = ['Success'];
 // =============================================================================
 
 /**
- * Regex for a basic but sufficient email shape check. Matches the rule
- * documented in docs/DataDictionary.md §1.8.
- *
- * The pipeline canonicalises stored emails to trimmed lowercase before
- * matching, so the regex itself is case-sensitive.
+ * Email shape check. Case-sensitive; emails are lowercased before matching.
  * @type {RegExp}
  */
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
- * Prefix shared by every accepted Drive folder URL. Used for cheap
- * pre-screening before running the regex.
+ * Prefix shared by every accepted Drive folder URL.
  * @type {string}
  */
 const FOLDER_URL_PREFIX = 'https://drive.google.com/drive/folders/';
 
 /**
- * Regex that matches a Drive folder URL and captures the folder ID
- * (the segment immediately after `/folders/`, terminated by `?`, `/`,
- * or end-of-string). Folder IDs may contain letters, digits,
- * underscores, and hyphens.
- *
- * File URLs (`/file/d/`) and the legacy `open?id=` form are
- * intentionally NOT matched — they are rejected with
- * INVALID_FOLDER_URL_FORMAT per docs/DataDictionary.md §1.12.
+ * Matches a Drive folder URL and captures the folder ID.
+ * File URLs (`/file/d/`) and `open?id=` are rejected with INVALID_FOLDER_URL_FORMAT.
  * @type {RegExp}
  */
 const FOLDER_URL_REGEX = /^https:\/\/drive\.google\.com\/drive\/folders\/([\w\-]+)/;
@@ -183,27 +144,19 @@ const FOLDER_URL_REGEX = /^https:\/\/drive\.google\.com\/drive\/folders\/([\w\-]
 // =============================================================================
 
 /**
- * IANA timezone for calendar-date comparisons. The production workbook
- * is maintained from Thailand, so we evaluate end dates in ICT to avoid
- * off-by-one revocations near midnight.
- *
- * Used by Utilities.formatDate() when converting native Date objects to
- * YYYY-MM-DD strings.
+ * IANA timezone for date comparisons (production workbook is maintained from Thailand).
  * @type {string}
  */
 const SCRIPT_TIMEZONE = 'Asia/Bangkok';
 
 /**
- * Calendar-date format used for serialisation in the JSON contract.
- * Discards any time-of-day component.
+ * ISO date format for serialisation.
  * @type {string}
  */
 const DATE_FORMAT_ISO = 'yyyy-MM-dd';
 
 /**
- * Human-readable text-date formats the parser will attempt, in order,
- * before rejecting a string cell. Locale is forced to en_US so month
- * names resolve consistently regardless of the script's runtime locale.
+ * Text-date formats the parser attempts, in order. Locale forced to en_US.
  * @type {string[]}
  */
 const TEXT_DATE_FORMATS = ['MMM d, yyyy', 'MMMM d, yyyy'];
@@ -213,12 +166,8 @@ const TEXT_DATE_FORMATS = ['MMM d, yyyy', 'MMMM d, yyyy'];
 // =============================================================================
 
 /**
- * Stable identifiers for every per-record validation failure. These
- * strings are persisted verbatim into the log sheet and used by
- * operators to filter — they MUST NOT be reworded without a
- * coordinated log-sheet migration.
- *
- * Source of truth: docs/DataDictionary.md §4.6.
+ * Stable per-record validation failure codes. Persisted to the log sheet —
+ * do NOT reword without a coordinated migration.
  * @enum {string}
  */
 const ERROR_CODES = {
@@ -239,10 +188,7 @@ const ERROR_CODES = {
 // =============================================================================
 
 /**
- * Stable identifiers for the per-record eligibility outcome. Persisted
- * into the log sheet; do not reword.
- *
- * Source of truth: docs/DataDictionary.md §3.4.
+ * Stable per-record eligibility outcomes. Persisted to the log sheet — do NOT reword.
  * @enum {string}
  */
 const ELIGIBILITY = {
@@ -259,95 +205,59 @@ const ELIGIBILITY = {
 // =============================================================================
 
 /**
- * Number of days to wait after an intern's END date before revoking
- * access. Provides a buffer for late handovers, appeals, or supervisor
- * overrides.
- *
- * A value of 0 means access is revoked the day AFTER the end date
- * (records whose endDate is strictly before today are eligible).
- *
- * Pending stakeholder confirmation in docs/OpenQuestions.md Q-05.
+ * Days to wait after END date before revoking. 0 = revoke the day after END.
  * @type {number}
  */
 const GRACE_PERIOD_DAYS = 0;
 
 /**
- * When true, the pipeline computes the candidate set and produces
- * complete logs but performs NO Drive mutations. Recommended true for
- * first deployments and any time the column mapping or source sheet
- * changes.
- *
- * The driveService module (not yet implemented) MUST honour this flag.
+ * When true, computes candidates and writes logs but performs NO Drive mutations.
  * @type {boolean}
  */
 const DRY_RUN = true;
 
 /**
- * Allowlist of email addresses that must NEVER be revoked, regardless
- * of input data. Matches after canonicalisation (trim + lowercase).
- *
- * Pending stakeholder confirmation in docs/OpenQuestions.md Q-06.
- * Populate with supervisor / IT-admin addresses before going live.
+ * Emails that must NEVER be revoked. Matched after trim + lowercase.
  * @type {string[]}
  */
 const EXCEPTION_EMAILS = [];
 
 /**
- * Email addresses to receive run-summary notifications. Per the
- * confirmed project assumption "No Notifications", this is empty —
- * the notification code path (when implemented) will be a no-op.
- *
- * If notifications are later enabled via docs/OpenQuestions.md Q-07,
- * populate this array.
+ * Notification recipients. Empty per "No Notifications" assumption.
  * @type {string[]}
  */
 const NOTIFICATION_RECIPIENTS = [];
 
 // =============================================================================
-// 10. Trigger schedule (constants only; triggerService.gs not yet implemented)
+// 10. Trigger schedule
 // =============================================================================
 
 /**
- * Hours of the day, in SCRIPT_TIMEZONE, at which the daily trigger
- * fires. Recommended 02:00 (off-hours, low Drive API contention).
- *
- * Used by the future triggerService.installTrigger() to build a
- * ScriptApp.newTrigger() time-based trigger.
+ * Hour (in SCRIPT_TIMEZONE) the daily trigger fires. Recommended 02:00.
  * @type {number}
  */
 const TRIGGER_HOUR = 2;
 
 /**
- * Minutes past TRIGGER_HOUR for the daily fire time. Picked off the
- * half-hour / quarter-hour marks to spread load across the script
- * runtime fleet.
+ * Minutes past TRIGGER_HOUR.
  * @type {number}
  */
 const TRIGGER_MINUTE = 0;
 
 // =============================================================================
-// 11. Supervisor sheet (source for the dynamic exception allowlist)
+// 11. Supervisor sheet (dynamic exception allowlist source)
 // =============================================================================
 
 /**
- * Name of the sheet that lists program supervisors. Used by
- * sheetService.readSupervisorEmails() to populate the dynamic exception
- * allowlist that supplements EXCEPTION_EMAILS above. main.gs merges the
- * two lists and publishes them to driveService via setExceptionEmails()
- * at the start of every run.
- *
- * Verified against the production workbook on 2026-06-16: the sheet
- * exists with headers `NAME`, `NICKNAME`, `JOB TITLE`, `EMAIL`, `TEL`
- * and contains 3 supervisor rows.
+ * Sheet listing program supervisors. Source for the dynamic exception allowlist
+ * merged with EXCEPTION_EMAILS at the start of every run.
  * @type {string}
  */
 const SUPERVISOR_SHEET_NAME = 'Supervisor';
 
 /**
  * Header text used to locate the email column in the Supervisor sheet.
- * Matching is by exact trimmed text, case-sensitive. If the header is
- * absent, readSupervisorEmails() returns an empty array rather than
- * throwing — supervisors are a safety net, not a hard dependency.
+ * If absent, readSupervisorEmails() returns [] (safety net, not a hard dependency).
  * @type {string}
  */
 const SUPERVISOR_EMAIL_HEADER = 'EMAIL';

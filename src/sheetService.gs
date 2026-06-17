@@ -2,77 +2,15 @@
  * @fileoverview Reader for the Timeline sheet. Sole owner of read access
  * to the production internship workbook.
  *
- * Responsibility:
- *   - Open the source sheet using SPREADSHEET_ID / SOURCE_SHEET_NAME.
- *   - Translate raw rows into typed InternRecord objects (per
- *     docs/DataDictionary.md), normalising formatting inconsistencies
- *     (mixed text/datetime cells, mixed string/numeric phone fields,
- *     multilingual name content, optional fields that may be blank).
- *   - Apply the full validation specification from
- *     docs/DataDictionary.md §4, populating each record's `validation`
- *     block with a controlled-vocabulary error code when a required
- *     field is missing or malformed.
- *   - Compute each record's eligibility outcome (ELIGIBLE,
- *     INELIGIBLE_NOT_ENDED, INELIGIBLE_ACTIVE, INELIGIBLE_EXCEPTION,
- *     INELIGIBLE_INVALID).
- *   - Return a wrapper object containing source metadata, the records
- *     array, and a run-level summary.
+ * Translates raw rows into typed InternRecord objects, applies the validation
+ * spec from docs/DataDictionary.md §4, and computes each record's eligibility.
  *
- * This file does NOT perform Drive operations and does NOT write back
- * to the spreadsheet. The write-back entry points
- * (writeRevocationStatus, appendLogEntries) declared in
- * docs/SystemDesign.md §2.2 are deferred to a later phase.
+ * Does NOT perform Drive operations or write back to the spreadsheet.
  *
  * Public API:
- *   - readInternRecords()      -> wrapper object (see sample below)
- *   - getEligibleCandidates()  -> InternRecord[] (subset of the above)
- *
- * ---------------------------------------------------------------------------
- * SAMPLE OUTPUT (abridged — see docs/DataDictionary.md §3 for full schema):
- *
- *   {
- *     "source": {
- *       "spreadsheetId": "1AOjCbe…rsmAkU",
- *       "sheetName": "Timeline",
- *       "snapshotAt": "2026-06-16T19:30:00.000Z",
- *       "rowCount": 1
- *     },
- *     "records": [
- *       {
- *         "rowNumber": 2,
- *         "position": "Programmer Trainee",
- *         "fullName": "Anantachai Khankang",
- *         "nickname": "Po",
- *         "internEmail": "antcpozxc@gmail.com",
- *         "internshipStartDate": "2025-08-01",
- *         "internshipEndDate": "2025-11-30",
- *         "internshipStatus": "Completed",
- *         "folderLink": "https://drive.google.com/drive/folders/1k7YCLeriyu-fEJhz3cQHL-oSidvGmFgx",
- *         "folderId": "1k7YCLeriyu-fEJhz3cQHL-oSidvGmFgx",
- *         "phone": "062-318-9418",
- *         "lineId": null,
- *         "university": "Kasetsart University",
- *         "workMode": "Hybrid",
- *         "firstDayWorkMode": "WFH",
- *         "trackingStatus": "Access Shared",
- *         "emailStatus": null,
- *         "validation": {
- *           "isValid": true,
- *           "eligibility": "ELIGIBLE",
- *           "errors": [],
- *           "warnings": []
- *         }
- *       }
- *     ],
- *     "summary": {
- *       "total": 1,
- *       "valid": 1,
- *       "invalid": 0,
- *       "skippedReasons": {}
- *     }
- *   }
- *
- * ---------------------------------------------------------------------------
+ *   - readInternRecords()      -> wrapper { source, records, summary }
+ *   - getEligibleCandidates()  -> InternRecord[] (ELIGIBLE only)
+ *   - readSupervisorEmails()   -> string[]
  */
 
 // =============================================================================
@@ -80,30 +18,23 @@
 // =============================================================================
 
 /**
- * Reads every non-blank data row from the source sheet and returns a
- * typed, validated wrapper object.
+ * Reads every non-blank data row and returns a typed, validated wrapper.
  *
- * The function performs a single batched `getValues()` read
- * (NFR-P3 in docs/Requirement.md) and never touches Drive.
+ * Single batched `getValues()` read (NFR-P3). Per-record validation failures
+ * are captured in each record's `validation` block — they do NOT abort the read.
+ * Unrecoverable errors (workbook missing, sheet missing, required header missing)
+ * throw for the caller (main.gs) to handle at FR-08 Layer 2.
  *
- * Per-record validation failures are captured in each record's
- * `validation` block — they do NOT abort the read. Unrecoverable
- * errors (workbook not found, sheet missing, required header missing)
- * throw a descriptive Error for the caller (main.gs) to handle at
- * FR-08 Layer 2.
- *
- * @returns {Object} Wrapper with `source`, `records`, and `summary`
- *                   fields, as documented in docs/DataDictionary.md §3.
- * @throws {Error} If the workbook cannot be opened, the sheet is
- *                 missing, or a required column header is absent.
+ * @returns {Object} Wrapper with `source`, `records`, and `summary` fields.
+ * @throws {Error} If the workbook cannot be opened, the sheet is missing,
+ *                 or a required column header is absent.
  */
 function readInternRecords() {
   const sheet = _openSourceSheet_();
   const lastRow = sheet.getLastRow();
   const lastCol = sheet.getLastColumn();
 
-  // Source metadata is captured even for empty sheets so the caller
-  // can distinguish "no data" from "could not read".
+  // Source metadata captured even for empty sheets (distinguish "no data").
   const sourceMeta = {
     spreadsheetId: SPREADSHEET_ID,
     sheetName: SOURCE_SHEET_NAME,
@@ -112,11 +43,9 @@ function readInternRecords() {
   };
 
   if (lastRow < 2 || lastCol < 1) {
-    // Header-only or completely empty sheet.
     return { source: sourceMeta, records: [], summary: _summarize_([]) };
   }
 
-  // Single batched read of the used range.
   const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
   const headers = values[0];
   const colIdx = _buildColumnIndex_(headers);
@@ -137,17 +66,10 @@ function readInternRecords() {
 }
 
 /**
- * Convenience wrapper that reads the source sheet and returns only the
- * records whose eligibility is `ELIGIBLE`. Useful for the main
- * controller's candidate-list step.
- *
- * Note: this calls readInternRecords() internally; callers that need
- * both the full wrapper and the filtered list should call
- * readInternRecords() once and filter the result themselves to avoid
- * a second sheet read.
- *
- * @returns {Object[]} Array of InternRecord objects with
- *                     `validation.eligibility === 'ELIGIBLE'`.
+ * Reads the source sheet and returns only ELIGIBLE records.
+ * Note: calls readInternRecords() internally — callers needing both should
+ * call it once and filter locally to avoid a second read.
+ * @returns {Object[]} InternRecord objects with `validation.eligibility === 'ELIGIBLE'`.
  */
 function getEligibleCandidates() {
   const wrapper = readInternRecords();
@@ -157,22 +79,12 @@ function getEligibleCandidates() {
 }
 
 /**
- * Reads the EMAIL column of the Supervisor sheet and returns the list
- * of canonicalised supervisor emails. Used by main.gs to populate the
- * dynamic exception allowlist that supplements EXCEPTION_EMAILS in
- * config.gs (per confirmed assumption #8: "Read supervisor emails from
- * the Supervisor sheet; never revoke supervisor accounts").
- *
- * Defensive behaviour — supervisors are a safety net, not a hard
- * dependency, so this function NEVER throws:
- *
- *   - Returns `[]` if the workbook cannot be opened.
- *   - Returns `[]` if the Supervisor sheet is missing or empty.
- *   - Returns `[]` if the EMAIL header is absent.
- *   - Silently skips blank cells and cells that fail EMAIL_REGEX.
+ * Reads the EMAIL column of the Supervisor sheet for the dynamic exception
+ * allowlist. Never throws — supervisors are a safety net, not a hard dependency:
+ *   - Returns [] if the workbook/sheet/EMAIL header is missing or empty.
+ *   - Silently skips blank cells and regex failures.
  *   - Deduplicates (case-insensitive after canonicalisation).
- *
- * @returns {string[]} Array of canonicalised (trim + lowercase) emails.
+ * @returns {string[]} Canonicalised (trim + lowercase) emails.
  */
 function readSupervisorEmails() {
   let ss;
@@ -188,7 +100,6 @@ function readSupervisorEmails() {
   const lastCol = sheet.getLastColumn();
   if (lastRow < 2 || lastCol < 1) return [];
 
-  // Single batched read of the used range.
   const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
   const headers = values[0];
   const emailIdx = _findHeaderIndex_(headers, SUPERVISOR_EMAIL_HEADER);
@@ -214,15 +125,8 @@ function readSupervisorEmails() {
 
 /**
  * Opens the production spreadsheet and returns the source sheet.
- *
- * Defensive on every failure mode that would otherwise crash the
- * pipeline mid-run:
- *   - Spreadsheet ID is wrong or the running user lacks access.
- *   - Source sheet has been renamed or deleted.
- *
  * @returns {GoogleAppsScript.Spreadsheet.Sheet} The source sheet.
- * @throws {Error} With a descriptive message naming the missing
- *                 resource, for the caller to surface via FR-08.
+ * @throws {Error} If the workbook or sheet is missing/inaccessible.
  * @private
  */
 function _openSourceSheet_() {
@@ -245,18 +149,14 @@ function _openSourceSheet_() {
 }
 
 /**
- * Builds a map from internal field name to 0-based column index, by
- * matching each entry in COLUMN_MAPPING against the sheet's header row.
+ * Builds a map from internal field name to 0-based column index by matching
+ * COLUMN_MAPPING headers against the sheet's header row.
  *
- * Matching is by exact header text. If a known required header is
- * absent, the function throws with a descriptive message listing every
- * missing required header — operators get one clear error instead of a
- * cascade. Optional headers that are absent simply do not appear in
- * the returned map (the typed readers return null for them).
+ * Throws if any REQUIRED header is missing, listing all missing required
+ * headers in one error. Optional missing headers simply don't appear in the map.
  *
- * @param {Object[]} headers - The header row from `getValues()[0]`.
- * @returns {Object<string, number>} Map of internal field name → 0-based
- *                                   column index.
+ * @param {Object[]} headers - Header row from `getValues()[0]`.
+ * @returns {Object<string, number>} Map of internal field name → column index.
  * @throws {Error} If any REQUIRED column's header cannot be located.
  * @private
  */
@@ -293,16 +193,10 @@ function _buildColumnIndex_(headers) {
 
 /**
  * Finds the 0-based column index of a header by exact trimmed text.
- * Used by readSupervisorEmails() to locate the EMAIL column on the
- * Supervisor sheet without hard-coding the column letter.
- *
- * Returns -1 when the header is absent so callers can fail soft
- * (rather than throw) — appropriate for a safety-net lookup where
- * missing data should degrade gracefully.
- *
- * @param {Object[]} headers - The header row from `getValues()[0]`.
- * @param {string} header - Exact (case-sensitive) header text to find.
- * @returns {number} 0-based column index, or -1 when not found.
+ * Returns -1 when absent (callers fail soft).
+ * @param {Object[]} headers - Header row.
+ * @param {string} header - Exact (case-sensitive) header text.
+ * @returns {number} Column index, or -1.
  * @private
  */
 function _findHeaderIndex_(headers, header) {
@@ -320,18 +214,11 @@ function _findHeaderIndex_(headers, header) {
 // =============================================================================
 
 /**
- * Converts a single raw sheet row into a typed InternRecord object,
- * running every validation rule from docs/DataDictionary.md §4.
+ * Converts a raw sheet row into a typed InternRecord, running every §4 rule.
+ * Always returns a record (valid or invalid) — caller filters by eligibility.
  *
- * Always returns a record object (valid or invalid). The caller
- * decides whether to filter based on `validation.eligibility`.
- *
- * Validation entries produced by the typed readers are collected into
- * a fresh per-record buffer (`buf`) and flushed into the record's
- * `validation.errors` / `validation.warnings` arrays at the end, with
- * simple deduplication by (code, field) so a single problem is not
- * reported twice (e.g. a malformed date being both parsed-as-null by
- * the reader and flagged-as-missing by the required-field check).
+ * Errors/warnings from typed readers are collected in `buf` and flushed into
+ * `validation.errors` / `validation.warnings` with dedup by (code, field).
  *
  * @param {Object[]} row - A single row from `getValues()`.
  * @param {Object<string, number>} colIdx - Field-to-column-index map.
@@ -340,7 +227,6 @@ function _findHeaderIndex_(headers, header) {
  * @private
  */
 function _mapRowToRecord_(row, colIdx, rowNumber) {
-  // Per-record buffer for errors/warnings emitted by typed readers.
   const buf = { errors: [], warnings: [] };
 
   const record = {
@@ -369,8 +255,7 @@ function _mapRowToRecord_(row, colIdx, rowNumber) {
     }
   };
 
-  // Folder link is special-cased because it produces two fields
-  // (URL + extracted ID) and has its own validation rules.
+  // Folder link produces two fields (URL + ID) and has its own validation.
   const folderResult = _readFolderLink_(row, colIdx.folderLink);
   record.folderLink = folderResult.url;
   record.folderId = folderResult.id;
@@ -378,9 +263,7 @@ function _mapRowToRecord_(row, colIdx, rowNumber) {
     buf.errors.push(folderResult.error);
   }
 
-  // Required-field checks cover the "missing entirely" case (as
-  // opposed to "present but malformed", which the readers already
-  // caught). Same code is used in both cases; dedup below handles it.
+  // Required-field checks cover "missing entirely" (readers caught "malformed").
   if (_isBlankValue_(record.fullName)) {
     buf.errors.push(_err_(ERROR_CODES.MISSING_NAME, 'NAME'));
   }
@@ -397,7 +280,7 @@ function _mapRowToRecord_(row, colIdx, rowNumber) {
     buf.errors.push(_err_(ERROR_CODES.MISSING_FOLDER, 'FOLDER LINK'));
   }
 
-  // Flush buffer into the validation block, deduplicating by (code, field).
+  // Flush buffer with dedup by (code, field).
   buf.errors.forEach(function (err) {
     const exists = record.validation.errors.some(function (e) {
       return e.code === err.code && e.field === err.field;
@@ -408,7 +291,6 @@ function _mapRowToRecord_(row, colIdx, rowNumber) {
     record.validation.warnings.push(w);
   });
 
-  // Derive final state from the error list.
   if (record.validation.errors.length > 0) {
     record.validation.isValid = false;
     record.validation.eligibility = ELIGIBILITY.INVALID;
@@ -424,12 +306,9 @@ function _mapRowToRecord_(row, colIdx, rowNumber) {
 // =============================================================================
 
 /**
- * Reads a free-text cell. Returns trimmed string or null when blank.
- * Coerces numbers to string (the phone / LINE columns store both forms).
- *
+ * Reads a free-text cell. Trimmed string or null. Coerces numbers to string.
  * @param {Object[]} row - Sheet row.
- * @param {number|undefined} idx - Column index, or undefined if the
- *        header was absent (optional column).
+ * @param {number|undefined} idx - Column index, or undefined if header absent.
  * @returns {?string}
  * @private
  */
@@ -441,11 +320,8 @@ function _readText_(row, idx) {
 }
 
 /**
- * Reads and validates the EMAIL column. Returns the canonical email
- * (trim + lowercase) or null when blank. When the cell is non-empty
- * but fails the regex, the original cleaned value is returned AND a
- * EMAIL_FORMAT entry is pushed onto `buf.errors`.
- *
+ * Reads the EMAIL column. Canonical email or null. Non-empty failures push
+ * EMAIL_FORMAT and return the cleaned value.
  * @param {Object[]} row - Sheet row.
  * @param {number|undefined} idx - Column index.
  * @param {{errors: Object[], warnings: Object[]}} buf - Per-record buffer.
@@ -464,16 +340,13 @@ function _readEmail_(row, idx, buf) {
 }
 
 /**
- * Reads a date cell. Accepts native Date objects and the text formats
- * documented in docs/DataDictionary.md §4.5. Ambiguous DD/MM forms
- * are rejected (never silently swapped).
- *
- * On parse failure, returns null AND pushes the appropriate error code.
+ * Reads a date cell. Accepts native Date and text formats in TEXT_DATE_FORMATS.
+ * Ambiguous DD/MM forms are rejected (never silently swapped).
+ * On parse failure, returns null and pushes the appropriate error code.
  *
  * @param {Object[]} row - Sheet row.
  * @param {number|undefined} idx - Column index.
- * @param {string} errorCodeSuffix - Either 'START_DATE' or 'END_DATE';
- *        used to look up the right ERROR_CODES key.
+ * @param {string} errorCodeSuffix - 'START_DATE' or 'END_DATE'.
  * @param {{errors: Object[], warnings: Object[]}} buf - Per-record buffer.
  * @returns {?string} ISO date string (yyyy-MM-dd), or null.
  * @private
@@ -486,7 +359,7 @@ function _readDate_(row, idx, errorCodeSuffix, buf) {
   if (_isBlankValue_(v)) return null;
 
   if (Object.prototype.toString.call(v) === '[object Date]') {
-    // Native datetime from Sheets. Retain calendar date only.
+    // Native datetime — retain calendar date only.
     if (isNaN(v.getTime())) {
       buf.errors.push(_err_(code, header));
       return null;
@@ -495,16 +368,13 @@ function _readDate_(row, idx, errorCodeSuffix, buf) {
   }
 
   if (typeof v === 'number') {
-    // A numeric value in a date column is not one of the accepted
-    // forms in docs/DataDictionary.md §4.5 (native Date, ISO string,
-    // or "MMM d, yyyy" string). Sheets serials and epoch-ms guesses
-    // are intentionally NOT supported — reject rather than risk a
-    // silent day/month/year misinterpretation (Risk R-03).
+    // Numeric dates are NOT supported — reject to avoid silent day/month/year
+    // misinterpretation (Risk R-03).
     buf.errors.push(_err_(code, header));
     return null;
   }
 
-  // Text cell — try ISO first, then the documented text formats.
+  // Text cell — try ISO first, then documented text formats.
   const s = String(v).trim();
   const iso = _parseIsoDate_(s);
   if (iso) return iso;
@@ -519,10 +389,7 @@ function _readDate_(row, idx, errorCodeSuffix, buf) {
 }
 
 /**
- * Reads an enum cell. Returns the canonical value if it matches the
- * allowed set (case-insensitively). Unknown values are passed through
- * unchanged with a WARN entry — non-blocking for optional columns.
- *
+ * Reads an enum cell case-insensitively. Unknown values pass through with WARN.
  * @param {Object[]} row - Sheet row.
  * @param {number|undefined} idx - Column index.
  * @param {string[]} allowed - Allowed enum values.
@@ -549,11 +416,8 @@ function _readEnum_(row, idx, allowed, buf) {
 }
 
 /**
- * Reads the INTERNSHIP STATUS column with strict enum enforcement.
- * Unlike other enum columns, an unknown value here IS a hard error
- * (it gates eligibility): an UNKNOWN status value pushes
- * STATUS_VALUE into `buf.errors`, marking the record INVALID.
- *
+ * Reads INTERNSHIP STATUS with strict enum enforcement.
+ * Unknown values are a hard error (gates eligibility) → STATUS_VALUE → INVALID.
  * @param {Object[]} row - Sheet row.
  * @param {number|undefined} idx - Column index.
  * @param {{errors: Object[], warnings: Object[]}} buf - Per-record buffer.
@@ -571,17 +435,14 @@ function _readStatus_(row, idx, buf) {
 }
 
 /**
- * Reads the FOLDER LINK cell, validates its URL form, and extracts
- * the folder ID.
+ * Reads the FOLDER LINK cell, validates URL form, extracts folder ID.
  *
  * @param {Object[]} row - Sheet row.
  * @param {number|undefined} idx - Column index.
  * @returns {{url: ?string, id: ?string, error: ?Object}}
- *   - `url`   : the trimmed URL string (always returned when present,
- *                even if malformed, for audit visibility).
- *   - `id`    : the extracted folder ID, or null.
- *   - `error` : a validation entry to be merged into the record's
- *                errors, or null when the URL is valid.
+ *   - `url`   : trimmed URL (returned even when malformed, for audit).
+ *   - `id`    : extracted folder ID, or null.
+ *   - `error` : validation entry to merge, or null.
  * @private
  */
 function _readFolderLink_(row, idx) {
@@ -617,17 +478,13 @@ function _readFolderLink_(row, idx) {
 // =============================================================================
 
 /**
- * Computes the eligibility outcome for a record that has already passed
- * validation (no errors). The order of checks encodes priority:
+ * Computes eligibility for a record that passed validation. Check order = priority:
+ *   1. EXCEPTION user — never revoked.
+ *   2. ACTIVE status  — overrides any date check.
+ *   3. NOT_ENDED      — end date still within grace window.
+ *   4. Otherwise      — ELIGIBLE.
  *
- *   1. EXCEPTION user  — never revoked, even if otherwise eligible.
- *   2. ACTIVE status   — overrides any date check.
- *   3. NOT_ENDED       — end date still within grace window.
- *   4. Otherwise       — ELIGIBLE.
- *
- * INELIGIBLE_ALREADY is documented but not yet produced: it requires a
- * per-intern status write-back column, which depends on
- * docs/OpenQuestions.md Q-04.
+ * INELIGIBLE_ALREADY is documented but not produced (requires write-back column).
  *
  * @param {Object} record - A valid InternRecord.
  * @returns {string} One of the ELIGIBILITY enum values.
@@ -640,8 +497,7 @@ function _computeEligibility_(record) {
   if (STATUS_ACTIVE.indexOf(record.internshipStatus) >= 0) {
     return ELIGIBILITY.ACTIVE;
   }
-  // Defensive: status should already be in OFFBOARDED if validation
-  // passed, but check explicitly in case the allowed set grows later.
+  // Defensive: status should be in OFFBOARDED if validation passed.
   if (STATUS_OFFBOARDED.indexOf(record.internshipStatus) < 0) {
     return ELIGIBILITY.INVALID;
   }
@@ -652,9 +508,7 @@ function _computeEligibility_(record) {
 }
 
 /**
- * Determines whether an email is on the EXCEPTION_EMAILS allowlist.
- * Both sides are canonicalised (trim + lowercase) before comparison.
- *
+ * True if email is on the EXCEPTION_EMAILS allowlist (case-insensitive).
  * @param {?string} email
  * @returns {boolean}
  * @private
@@ -669,13 +523,10 @@ function _isExceptionUser_(email) {
 }
 
 /**
- * Compares the intern's end date (yyyy-MM-dd string) against today minus
- * the configured grace period. Returns true only when the end date is
- * strictly before the cutoff — i.e. access should be revoked.
+ * True when endDate is strictly before today minus grace period.
  *
- * Using `<` (not `<=`) is intentional: an intern whose end date is
- * today still has access for the rest of today. Revocation happens
- * from tomorrow onward (or after the grace window).
+ * `<` (not `<=`) is intentional: an intern whose end date is today still
+ * has access for the rest of today.
  *
  * @param {?string} isoEndDate - yyyy-MM-dd string, or null.
  * @returns {boolean}
@@ -695,10 +546,8 @@ function _hasEndDatePassed_(isoEndDate) {
 // =============================================================================
 
 /**
- * Builds the run-level summary block. Counts valid / invalid records
- * and aggregates skip reasons into a stable map keyed by error code
- * (for invalid records) or eligibility value (for valid-but-ineligible).
- *
+ * Builds the run-level summary: counts valid/invalid, aggregates skip reasons
+ * keyed by error code (invalid) or eligibility value (ineligible).
  * @param {Object[]} records
  * @returns {Object}
  * @private
@@ -753,8 +602,7 @@ function _err_(code, field) {
 }
 
 /**
- * Maps an ERROR_CODES suffix (START_DATE / END_DATE) to its source
- * header name, used when building validation messages.
+ * Maps an ERROR_CODES suffix (START_DATE / END_DATE) to its source header.
  * @param {string} suffix
  * @returns {string}
  * @private
@@ -766,8 +614,7 @@ function _headerForCode_(suffix) {
 }
 
 /**
- * Formats a Date to a yyyy-MM-dd string in SCRIPT_TIMEZONE. Discards
- * any time-of-day component.
+ * Formats a Date to yyyy-MM-dd in SCRIPT_TIMEZONE (discards time-of-day).
  * @param {Date} date
  * @returns {string}
  * @private
@@ -777,12 +624,8 @@ function _isoDate_(date) {
 }
 
 /**
- * Parses a yyyy-MM-dd string and returns the same canonical form.
- * Returns null if the string is not a valid ISO date (e.g. rejects
- * 2026-13-40 by reconstructing the Date and checking the fields round-trip).
- *
- * Ambiguous DD/MM/YYYY forms are simply not matched by the regex.
- *
+ * Parses a yyyy-MM-dd string. Returns null if invalid (e.g. rejects 2026-13-40
+ * by round-trip field check). Ambiguous DD/MM/YYYY forms are not matched.
  * @param {string} s
  * @returns {?string}
  * @private
@@ -801,12 +644,9 @@ function _parseIsoDate_(s) {
 }
 
 /**
- * Parses a text date like "Jan 5, 2026" using a manual month lookup
- * so the result does not depend on the runtime's locale.
- *
+ * Parses a text date like "Jan 5, 2026" via manual month lookup (locale-free).
  * @param {string} s
- * @param {string} _format - Format pattern (currently ignored; both
- *        short and long month names are accepted via the same parser).
+ * @param {string} _format - Format pattern (currently ignored).
  * @returns {?string}
  * @private
  */
@@ -843,8 +683,7 @@ function _isBlankValue_(v) {
 }
 
 /**
- * True when an entire row has no non-blank cells. Per §4.9 these rows
- * are silently skipped (not counted, not logged).
+ * True when an entire row has no non-blank cells (§4.9 — silently skipped).
  * @param {Object[]} row
  * @returns {boolean}
  * @private

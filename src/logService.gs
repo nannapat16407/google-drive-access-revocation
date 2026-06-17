@@ -1,24 +1,13 @@
 /**
- * @fileoverview Structured execution logging for audit and troubleshooting.
+ * @fileoverview Structured execution logging for audit.
  *
- * Responsibility:
- *   - Persist one log row per intern processed, capturing: run ID,
- *     timestamp, intern identifier (name + sheet row), email, folder ID,
- *     action code, outcome, and any error message.
- *   - Persist a single run-summary row per invocation, capturing run
- *     metadata (started-at, ended-at, duration, trigger source, dry-run
- *     flag) and aggregated counts (total candidates, revoked, already
- *     revoked, skipped, failed).
- *   - Provide a thin in-memory buffer so that a single invocation
- *     flushes once at the end, minimising Sheets API quota usage
- *     (NFR-R3 in docs/Requirement.md).
+ * Persists one log row per intern processed plus a single run-summary row per
+ * invocation. Uses an in-memory buffer flushed once at end to minimise Sheets
+ * API quota usage (NFR-R3).
  *
- * Single-sheet, two-row-type design:
- *   Intern rows and run-summary rows share one schema (LOG_COLUMNS).
- *   For an INTERN row, the summary-specific columns are written as
- *   blanks; for a RUN_SUMMARY row, the intern-specific columns are
- *   written as blanks. This keeps the append path a single batched
- *   `setValues()` call regardless of row mix.
+ * Intern rows and RUN_SUMMARY rows share one schema (LOG_COLUMNS); the
+ * `rowType` column discriminates them. This keeps the append path a single
+ * batched `setValues()` call regardless of row mix.
  *
  * Public API:
  *   - startRun(opts?)              -> RunContext
@@ -26,17 +15,10 @@
  *   - endRun(summary)              -> { runId, endedAt, durationMs }
  *   - flush()                      -> number of rows written
  *
- * Dependencies: config.gs (SPREADSHEET_ID, LOG_SHEET_NAME,
- *               SCRIPT_TIMEZONE, DRY_RUN).
- *
- * Idempotency / sequencing:
- *   - startRun must be called before recordInternResult or endRun.
- *     Calling them out of order throws — defensive against silent
- *     data loss.
- *   - flush is independent of run state. It writes whatever is in
- *     the buffer. Safe to call multiple times.
- *   - Module state does NOT persist across Apps Script invocations,
- *     so _currentRun and _buffer start empty on every trigger fire.
+ * Sequencing:
+ *   - startRun must precede recordInternResult / endRun (else throws).
+ *   - flush is independent of run state and safe to call multiple times.
+ *   - Module state does NOT persist across Apps Script invocations.
  */
 
 // =============================================================================
@@ -44,41 +26,31 @@
 // =============================================================================
 
 /**
- * Format string used for timestamps written to the log sheet.
- * Produces ISO-8601 in SCRIPT_TIMEZONE, e.g. "2026-06-16T14:30:00+07:00".
+ * Timestamp format written to the log sheet. ISO-8601 in SCRIPT_TIMEZONE.
  * @type {string}
  */
 const LOG_TIMESTAMP_FORMAT = "yyyy-MM-dd'T'HH:mm:ssXXX";
 
 /**
- * Defines the log sheet schema. Each entry produces one column. The
- * order here is the column order in the sheet.
+ * Log sheet schema. Order here = column order in the sheet.
  *
  * Schema evolution rules:
- *   - New columns MUST be appended at the end. Never insert in the
- *     middle — historical rows would silently shift under the new
- *     headers.
- *   - Existing headers MUST NOT be reworded. Operators filter by them.
- *   - When adding a column, existing rows (written before the column
- *     existed) will simply have a blank cell in the new column. The
- *     header is rewritten only when the sheet is created from scratch;
- *     pre-existing sheets keep their original headers.
- *
- * The shared-schema design means intern rows write blanks into the
- * summary-specific fields, and summary rows write blanks into the
- * intern-specific fields. The `rowType` column is the discriminator.
+ *   - New columns MUST be appended at the end (never insert mid-sheet).
+ *   - Existing headers MUST NOT be reworded (operators filter by them).
+ *   - Pre-existing sheets keep their original headers; only fresh sheets
+ *     get the current schema written to row 1.
  *
  * @type {Array<{field: string, header: string}>}
  */
 const LOG_COLUMNS = [
-  // Columns shared by both row types — always populated.
+  // Shared by both row types — always populated.
   { field: 'rowType',             header: 'ROW TYPE' },
   { field: 'runId',               header: 'RUN ID' },
   { field: 'timestamp',           header: 'TIMESTAMP' },
   { field: 'triggerSource',       header: 'TRIGGER SOURCE' },
   { field: 'dryRun',              header: 'DRY RUN' },
 
-  // Intern-specific columns. Blank on RUN_SUMMARY rows.
+  // Intern-specific. Blank on RUN_SUMMARY rows.
   { field: 'fullName',            header: 'FULL NAME' },
   { field: 'rowNumber',           header: 'ROW NUMBER' },
   { field: 'internEmail',         header: 'INTERN EMAIL' },
@@ -87,7 +59,7 @@ const LOG_COLUMNS = [
   { field: 'outcome',             header: 'OUTCOME' },
   { field: 'message',             header: 'MESSAGE' },
 
-  // Run-summary-specific columns. Blank on INTERN rows.
+  // Run-summary-specific. Blank on INTERN rows.
   { field: 'startedAt',           header: 'STARTED AT' },
   { field: 'endedAt',             header: 'ENDED AT' },
   { field: 'durationMs',          header: 'DURATION (MS)' },
@@ -99,7 +71,7 @@ const LOG_COLUMNS = [
 ];
 
 /**
- * Discriminator values written to the first column (`ROW TYPE`).
+ * Discriminator values for the ROW TYPE column.
  * @enum {string}
  */
 const LOG_ROW_TYPE = {
@@ -113,17 +85,12 @@ const LOG_ROW_TYPE = {
 
 /**
  * Active run context, or null when no run is in progress.
- *
- * Set by startRun, cleared by endRun. recordInternResult and endRun
- * consult this; flush does not.
  * @type {?Object}
  */
 let _currentRun = null;
 
 /**
- * Rows queued for write. Each entry is a partial object keyed by the
- * `field` names in LOG_COLUMNS. flush() materialises each row into a
- * full column-width array, defaulting blanks to ''.
+ * Rows queued for write. flush() materialises each into a column-width array.
  * @type {Object[]}
  */
 let _buffer = [];
@@ -133,22 +100,12 @@ let _buffer = [];
 // =============================================================================
 
 /**
- * Begins a new run. Allocates a unique run ID, records the started-at
- * timestamp, and resets the in-memory buffer.
- *
- * Must be called once per run, before recordInternResult / endRun.
- * Calling startRun while another run is active throws — defensive
- * against accidentally interleaved runs.
+ * Begins a new run. Allocates a run ID, records started-at, resets the buffer.
+ * Throws if a run is already active.
  *
  * @param {{triggerSource: ?string, dryRun: ?boolean}=} opts
- *     `triggerSource` is a short label identifying how the run was
- *     invoked (e.g. 'SCHEDULED', 'MANUAL', 'TEST'). Defaults to
- *     'MANUAL'. `dryRun` is the run-level dry-run flag; defaults to
- *     the global DRY_RUN from config.gs.
  * @returns {{runId: string, startedAt: string, triggerSource: string, dryRun: boolean}}
- *     A snapshot of the run context. The internal _currentRun also
- *     holds a millisecond timestamp used to compute duration in
- *     endRun; callers should treat the returned object as read-only.
+ *     Snapshot of the run context. Treat as read-only.
  * @throws {Error} If a run is already active.
  */
 function startRun(opts) {
@@ -180,11 +137,7 @@ function startRun(opts) {
 }
 
 /**
- * Buffers one INTERN row describing the outcome of processing a
- * single intern. The row is persisted on the next flush().
- *
- * Required sequencing: startRun must have been called and endRun
- * must NOT yet have been called for the current run.
+ * Buffers one INTERN row for a single intern's outcome. Persisted on next flush().
  *
  * @param {{
  *   fullName: ?string,
@@ -195,10 +148,7 @@ function startRun(opts) {
  *   outcome: ?string,
  *   message: ?string
  * }} entry
- *     `action` is one of the outcome codes from driveService
- *     (REVOKED, ALREADY_REVOKED, ALREADY_REVOKED_PROVISIONED,
- *     SKIPPED_EXCEPTION_USER, DRIVE_API_ERROR, FOLDER_NOT_ACCESSIBLE,
- *     DRY_RUN) or 'DRIVE_API_ERROR' for unexpected pipeline errors.
+ *     `action` is a driveService outcome code or 'DRIVE_API_ERROR'.
  *     `outcome` is 'success' or 'failure'.
  * @throws {Error} If no run is currently active.
  */
@@ -229,13 +179,8 @@ function recordInternResult(entry) {
 }
 
 /**
- * Finalises the current run. Computes ended-at and duration, pushes a
- * single RUN_SUMMARY row to the buffer, and clears the active-run
- * pointer.
- *
- * flush() is intentionally NOT called here. Callers decide when to
- * persist (typically immediately after endRun, but tests may inspect
- * the buffer in between).
+ * Finalises the run: computes ended-at + duration, pushes a RUN_SUMMARY row,
+ * clears the active-run pointer. Does NOT flush (caller decides when).
  *
  * @param {{
  *   totalCandidates: number,
@@ -244,8 +189,6 @@ function recordInternResult(entry) {
  *   skipped: number,
  *   failed: number
  * }} summary
- *     Aggregated counts for the run. Missing or non-numeric values
- *     default to 0.
  * @returns {{runId: string, endedAt: string, durationMs: number}}
  * @throws {Error} If no run is currently active.
  */
@@ -293,29 +236,19 @@ function endRun(summary) {
 }
 
 /**
- * Writes all buffered rows to the log sheet in a single batched
- * `setValues()` call (NFR-R3). Creates the log sheet with the
- * canonical headers if it does not exist. Clears the buffer after a
- * successful write.
+ * Writes all buffered rows in a single batched `setValues()` call (NFR-R3).
+ * Creates the log sheet with canonical headers if missing. Clears the buffer
+ * on success. Safe to call multiple times; no-op when buffer is empty.
+ * Buffer is preserved if the Sheets API call fails.
  *
- * Safe to call multiple times per invocation. A no-op when the
- * buffer is empty.
- *
- * If the underlying Sheets API call fails, the buffer is preserved
- * so the next flush() retry writes the same data.
- *
- * @returns {number} Number of rows written. 0 if the buffer was empty.
- * @throws {Error} If the workbook cannot be opened (the log sheet
- *                 lives in the same workbook as the source data —
- *                 see docs/SystemDesign.md §1).
+ * @returns {number} Rows written. 0 if the buffer was empty.
+ * @throws {Error} If the workbook cannot be opened.
  */
 function flush() {
   if (_buffer.length === 0) return 0;
   const sheet = _ensureLogSheet_();
 
-  // Materialise each buffered partial row into a full column-width
-  // array, defaulting missing fields to '' so setValues receives a
-  // strictly rectangular matrix.
+  // Materialise partial rows into a full rectangular matrix (blanks -> '').
   const rows = _buffer.map(function (row) {
     return LOG_COLUMNS.map(function (col) {
       const v = row[col.field];
@@ -338,15 +271,12 @@ function flush() {
 // =============================================================================
 
 /**
- * Opens the log sheet, creating it with the canonical headers if
- * missing.
+ * Opens the log sheet, creating it with canonical headers if missing.
  *
- * Headers are written exactly once, when the sheet is first created.
- * Subsequent schema additions (appended columns in LOG_COLUMNS) are
- * NOT retroactively applied to existing sheets — operators who want
- * the new column must rename the old sheet (so a fresh one is
- * created) or add the column manually. This is intentional: silently
- * rewriting headers on an audit sheet is a footgun.
+ * Headers are written only when the sheet is first created. Schema additions
+ * are NOT retroactively applied to existing sheets — operators must rename
+ * the old sheet (so a fresh one is created) or add the column manually.
+ * (Silently rewriting headers on an audit sheet is a footgun.)
  *
  * @returns {GoogleAppsScript.Spreadsheet.Sheet}
  * @throws {Error} If the workbook cannot be opened.
@@ -368,8 +298,7 @@ function _ensureLogSheet_() {
     sheet
       .getRange(1, 1, 1, LOG_COLUMNS.length)
       .setValues([LOG_COLUMNS.map(function (c) { return c.header; })]);
-    // Best-effort visual formatting. Failures here are cosmetic and
-    // must not abort the run.
+    // Best-effort visual formatting. Cosmetic failures swallowed.
     try {
       sheet.getRange(1, 1, 1, LOG_COLUMNS.length).setFontWeight('bold');
       sheet.setFrozenRows(1);
@@ -385,7 +314,7 @@ function _ensureLogSheet_() {
 // =============================================================================
 
 /**
- * Formats a Date as an ISO-8601 string in SCRIPT_TIMEZONE.
+ * Formats a Date as ISO-8601 in SCRIPT_TIMEZONE.
  * @param {Date} date
  * @returns {string}
  * @private
@@ -396,10 +325,7 @@ function _formatTimestamp_(date) {
 
 /**
  * Generates a sortable, unique run ID like "R-20260616T023000-a1b2".
- *
- * The timestamp component gives sortability and human-readability;
- * the random suffix disambiguates two runs that start within the same
- * second (rare but possible during manual testing).
+ * Random suffix disambiguates runs starting in the same second.
  * @param {Date} date
  * @returns {string}
  * @private
@@ -413,9 +339,7 @@ function _newRunId_(date) {
 }
 
 /**
- * Coerces a value to a non-negative integer. Returns 0 for missing,
- * non-finite, or negative inputs. Used by endRun so a malformed
- * summary object cannot produce negative counts in the log.
+ * Coerces a value to a non-negative integer. Returns 0 for missing/invalid input.
  * @param {*} v
  * @returns {number}
  * @private

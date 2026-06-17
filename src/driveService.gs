@@ -1,45 +1,27 @@
 /**
- * @fileoverview Wrapper around DriveApp for revoking per-intern access to
- * assigned folders. Sole owner of all Drive permission mutations.
+ * @fileoverview DriveApp wrapper for revoking per-intern folder access.
+ * Sole owner of all Drive permission mutations.
  *
- * Confirmed assumptions governing this implementation:
- *   - Permission type : Direct Share (the intern was added by email).
+ * Assumptions:
+ *   - Permission type : Direct Share (intern added by email).
  *   - Folder scope    : Main folder only (no recursive subfolder walk).
- *   - The script owner has at least Editor / Manager permission on every
- *     intern folder, so it can enumerate and remove permissions.
+ *   - Script owner has Editor/Manager permission on every intern folder.
  *
- * Public API (per docs/SystemDesign.md §2.3):
+ * Public API:
  *   - revokeAccess(folderUrlOrId, internEmail, opts?)  -> RevocationResult
  *   - listPermissions(folderUrlOrId)                   -> PermissionInfo[]
  *   - isExceptionUser(email)                           -> boolean
  *
- * Outcome codes returned in RevocationResult.action are the controlled
- * vocabulary defined in docs/DataDictionary.md §4.7:
- *
- *   REVOKED                     Permission was found and removed.
+ * RevocationResult.action codes (controlled vocabulary):
+ *   REVOKED                     Permission found and removed.
  *   ALREADY_REVOKED             No permission found; treated as success.
- *   ALREADY_REVOKED_PROVISIONED Same as above but `trackingStatus` was
- *                               'Access Shared' — flagged at WARN because
- *                               a permission was expected to exist.
+ *   ALREADY_REVOKED_PROVISIONED Same, but `trackingStatus` was 'Access Shared' (WARN).
  *   SKIPPED_EXCEPTION_USER      Email is on EXCEPTION_EMAILS; no action.
  *   DRIVE_API_ERROR             Drive call failed after bounded retries.
- *   FOLDER_NOT_ACCESSIBLE       Folder does not exist or the running user
- *                               cannot read its permissions.
- *   DRY_RUN                     DRY_RUN is on (or overridden); no Drive
- *                               mutation performed.
+ *   FOLDER_NOT_ACCESSIBLE       Folder missing or unreadable by running user.
+ *   DRY_RUN                     DRY_RUN is on; no mutation performed.
  *
- * OAuth scope required: https://www.googleapis.com/auth/drive
- * (declared in appsscript.json at project-link time).
- *
- * Limitations:
- *   - Uses DriveApp rather than the Drive Advanced Service. DriveApp
- *     covers editors, viewers, and commenters (via getViewers() /
- *     removeViewer()), which is sufficient for Direct Share. If future
- *     requirements need raw permission IDs or wildcard shares, switch
- *     to Drive.Permissions.list / Drive.Permissions.remove.
- *   - Does not walk subfolders (per Folder Scope assumption).
- *   - Does not handle Google Group membership (per Direct Share
- *     assumption; see docs/OpenQuestions.md Q-08).
+ * OAuth scope: https://www.googleapis.com/auth/drive
  */
 
 // =============================================================================
@@ -47,45 +29,28 @@
 // =============================================================================
 
 /**
- * Maximum number of retries on transient Drive errors (HTTP 429 / 5xx,
- * timeouts). Total attempts = DRIVE_MAX_RETRIES + 1.
- *
- * Sourced from NFR-R2 (bounded back-off) and tuned to stay within the
- * Apps Script 6-minute execution budget even on a 100-candidate run.
+ * Max retries on transient Drive errors (429 / 5xx, timeouts).
+ * Total attempts = DRIVE_MAX_RETRIES + 1.
  * @type {number}
  */
 const DRIVE_MAX_RETRIES = 3;
 
 /**
- * Base delay in milliseconds for the first retry. Subsequent retries
- * double the delay: 500ms, 1000ms, 2000ms.
- *
- * Total worst-case wait per failing call ≈ 3.5s, well within quotas.
+ * Base backoff for first retry. Doubles each retry: 500ms, 1000ms, 2000ms.
  * @type {number}
  */
 const DRIVE_RETRY_BASE_MS = 500;
 
 /**
- * Minimum length for a folder ID accepted by _resolveFolderId_ when the
- * input is not a URL. Drive IDs in practice are 25–45 chars of
- * [A-Za-z0-9_-]; we use a conservative lower bound to reject obvious
- * garbage without over-constraining.
+ * Min length for a raw folder ID input. Drive IDs are typically 25–45 chars.
  * @type {number}
  */
 const DRIVE_FOLDER_ID_MIN_LENGTH = 8;
 
 /**
- * Runtime exception list that supplements the static EXCEPTION_EMAILS
- * array in config.gs. Populated by main.gs at the start of every run
- * via setExceptionEmails(), typically with supervisor emails read from
- * the Supervisor sheet.
- *
- * Stays empty until setExceptionEmails() is first called, so the
- * module's default behaviour is identical to the pre-setter version.
- *
- * Apps Script module state does not persist across invocations, so
- * this resets to `[]` on every trigger fire — main.gs repopulates it
- * each run.
+ * Runtime exception list supplementing EXCEPTION_EMAILS. Populated each run
+ * by main.gs via setExceptionEmails() (typically supervisor emails).
+ * Resets to `[]` on every trigger fire (Apps Script module state is per-invocation).
  * @type {string[]}
  */
 let _dynamicExceptionEmails = [];
@@ -95,13 +60,9 @@ let _dynamicExceptionEmails = [];
 // =============================================================================
 
 /**
- * Revokes an intern's access to their assigned Drive folder.
+ * Revokes an intern's access to their assigned Drive folder. Idempotent (NFR-S5).
  *
- * The function is idempotent (NFR-S5): calling it on an intern who has
- * already been revoked returns ALREADY_REVOKED with `outcome: 'success'`,
- * never an error.
- *
- * Order of checks (priority encoded by control flow):
+ * Check order:
  *   1. Validate inputs           -> DRIVE_API_ERROR on bad folder/email.
  *   2. Exception allowlist       -> SKIPPED_EXCEPTION_USER.
  *   3. Dry-run                   -> DRY_RUN.
@@ -110,17 +71,12 @@ let _dynamicExceptionEmails = [];
  *   6. Match + remove            -> REVOKED or DRIVE_API_ERROR.
  *   7. No match                  -> ALREADY_REVOKED (or _PROVISIONED).
  *
- * @param {string} folderUrlOrId - Either a Drive folder URL
- *     (`https://drive.google.com/drive/folders/{id}`) or a raw folder ID.
- * @param {string} internEmail - The intern's email. Canonicalised to
- *     trimmed lowercase before matching.
+ * @param {string} folderUrlOrId - Folder URL or raw folder ID.
+ * @param {string} internEmail - Intern's email (canonicalised before matching).
  * @param {{trackingStatus: ?string, dryRunOverride: ?boolean}=} opts
- *     Optional. `trackingStatus` (typically the value from the
- *     TRACKING STATUS column) escalates ALREADY_REVOKED to
- *     ALREADY_REVOKED_PROVISIONED when set to 'Access Shared'.
- *     `dryRunOverride` forces dry-run on/off regardless of the global
- *     DRY_RUN flag; useful for ad-hoc previews.
- * @returns {RevocationResult} See typedef below.
+ *     `trackingStatus` escalates ALREADY_REVOKED to ALREADY_REVOKED_PROVISIONED
+ *     when 'Access Shared'. `dryRunOverride` forces dry-run on/off.
+ * @returns {RevocationResult}
  */
 function revokeAccess(folderUrlOrId, internEmail, opts) {
   opts = opts || {};
@@ -141,15 +97,13 @@ function revokeAccess(folderUrlOrId, internEmail, opts) {
       'Could not resolve a valid email from input: "' + internEmail + '".', 0);
   }
 
-  // 2. Exception allowlist — never revoke, even in dry-run mode.
+  // 2. Exception allowlist — never revoke.
   if (isExceptionUser(email)) {
     return _result_(folderId, email, 'SKIPPED_EXCEPTION_USER', 'success', null, 0);
   }
 
-  // 3. Dry-run short-circuit. We DO look up the folder and permission
-  //    set under dry-run so the log can report what WOULD have happened,
-  //    but we never call removeEditor / removeViewer.
-  // 4 + 5. Open folder and enumerate permissions (with retry).
+  // 3-5. Open folder + enumerate permissions (with retry). Under dry-run we
+  //    still look up so the log can report what WOULD have happened.
   const opened = _openFolderWithRetry_(folderId);
   if (!opened.ok) {
     return _result_(folderId, email, opened.code, 'failure', opened.message, opened.attempts);
@@ -165,15 +119,12 @@ function revokeAccess(folderUrlOrId, internEmail, opts) {
     return _result_(folderId, email, viewers.code, 'failure', viewers.message, viewers.attempts);
   }
 
-  // 6. Match by email. Commenter access is reported by DriveApp as a
-  //    viewer, so checking getViewers() covers both viewer and commenter
-  //    roles.
+  // 6. Match by email. Commenters appear in getViewers() (DriveApp flattens).
   const totalAttempts = editors.attempts + viewers.attempts;
   const isEditor = _findUserByEmail_(editors.value, email) !== null;
   const isViewer = _findUserByEmail_(viewers.value, email) !== null;
 
   if (dryRun) {
-    // Report the action that WOULD have been taken.
     if (isEditor || isViewer) {
       const role = isEditor ? 'editor' : 'viewer';
       return _result_(folderId, email, 'DRY_RUN', 'success',
@@ -188,10 +139,7 @@ function revokeAccess(folderUrlOrId, internEmail, opts) {
     return _alreadyRevokedResult_(folderId, email, trackingStatus, totalAttempts);
   }
 
-  // 6 (cont.). Remove with bounded retry. removeEditor/removeViewer are
-  //    idempotent at the Drive level — calling them when the user is
-  //    not in the list is a no-op — but we only call after a positive
-  //    match above, so the call count is meaningful.
+  // 6 (cont). Remove with bounded retry.
   const removalOutcome = isEditor
     ? _removeWithRetry_(function () { folder.removeEditor(email); }, 'removeEditor')
     : _removeWithRetry_(function () { folder.removeViewer(email); }, 'removeViewer');
@@ -206,18 +154,12 @@ function revokeAccess(folderUrlOrId, internEmail, opts) {
 }
 
 /**
- * Lists every account that currently has direct access to a folder, for
- * audit / debugging purposes.
+ * Lists every account with direct access to a folder (audit / debugging).
+ * Commenters appear as `role: 'viewer'` (DriveApp does not distinguish).
  *
- * Returns a flat array combining editors, viewers, and commenters.
- * Commenters appear with `role: 'viewer'` because DriveApp does not
- * distinguish the two.
- *
- * @param {string} folderUrlOrId - Folder URL or raw ID.
+ * @param {string} folderUrlOrId
  * @returns {Array<{emailAddress: string, role: string, source: string}>}
- *     role is 'editor' or 'viewer'; source is 'getEditors' or
- *     'getViewers'. Returns an empty array if the folder cannot be
- *     opened (callers should consult revokeAccess for diagnostics).
+ *     Empty array if the folder cannot be opened.
  */
 function listPermissions(folderUrlOrId) {
   const folderId = _resolveFolderId_(folderUrlOrId);
@@ -253,22 +195,8 @@ function listPermissions(folderUrlOrId) {
 }
 
 /**
- * Determines whether an email is on the exception allowlist. The
- * allowlist has two sources, both checked here:
- *
- *   1. EXCEPTION_EMAILS (config.gs)  — the static, hard-coded list.
- *   2. _dynamicExceptionEmails      — populated at runtime by
- *      setExceptionEmails(), typically with supervisor emails read
- *      from the Supervisor sheet by main.gs.
- *
- * Both sides are canonicalised (trim + lowercase) before comparison.
- *
- * Implemented locally in driveService rather than imported from
- * sheetService to keep service boundaries clean: driveService is the
- * sole enforcer of the allowlist at permission-mutation time
- * (NFR-S2), and depending on sheetService for the check would create
- * an unwanted cross-service coupling.
- *
+ * True if email is on the exception allowlist (static EXCEPTION_EMAILS
+ * or runtime _dynamicExceptionEmails). Both sides canonicalised before compare.
  * @param {string} email
  * @returns {boolean}
  */
@@ -287,18 +215,8 @@ function isExceptionUser(email) {
 }
 
 /**
- * Replaces the runtime exception list. main.gs calls this once per
- * run with the supervisor emails read from the Supervisor sheet.
- * Pass an empty array to reset.
- *
- * Emails are canonicalised (trim + lowercase) on input so the
- * comparison in isExceptionUser stays cheap and case-insensitive.
- * Malformed entries are silently dropped (they would never match a
- * valid intern email anyway).
- *
- * This setter is additive: it does not modify EXCEPTION_EMAILS, and
- * the module's default behaviour (with no setter call) is unchanged.
- *
+ * Replaces the runtime exception list. main.gs calls this once per run.
+ * Emails canonicalised on input; malformed entries silently dropped.
  * @param {string[]} emails
  */
 function setExceptionEmails(emails) {
@@ -316,9 +234,7 @@ function setExceptionEmails(emails) {
 // =============================================================================
 
 /**
- * Accepts either a Drive folder URL or a raw folder ID and returns the
- * ID. Returns null when the input cannot be resolved.
- *
+ * Resolves a folder URL or raw ID to the folder ID. Null if unresolvable.
  * @param {*} input
  * @returns {?string}
  * @private
@@ -332,7 +248,7 @@ function _resolveFolderId_(input) {
   const match = FOLDER_URL_REGEX.exec(s);
   if (match && match[1]) return match[1];
 
-  // Raw ID form: allow letters, digits, underscores, hyphens.
+  // Raw ID form.
   if (/^[\w\-]+$/.test(s) && s.length >= DRIVE_FOLDER_ID_MIN_LENGTH) {
     return s;
   }
@@ -340,9 +256,7 @@ function _resolveFolderId_(input) {
 }
 
 /**
- * Canonicalises an email (trim + lowercase) and validates the format.
- * Returns null when the input is not a usable email.
- *
+ * Canonicalises an email and validates the format. Null if invalid.
  * @param {*} input
  * @returns {?string}
  * @private
@@ -359,8 +273,7 @@ function _canonicalEmail_(input) {
 // =============================================================================
 
 /**
- * Opens a folder by ID with bounded retry on transient errors.
- *
+ * Opens a folder by ID with bounded retry.
  * @param {string} folderId
  * @returns {{ok: boolean, folder: ?GoogleAppsScript.Drive.Folder,
  *            code: string, message: ?string, attempts: number}}
@@ -373,8 +286,7 @@ function _openFolderWithRetry_(folderId) {
   if (r.ok) {
     return { ok: true, folder: r.value, code: '', message: null, attempts: r.attempts };
   }
-  // Folder-level failures are usually 404 / 403 — surface as
-  // FOLDER_NOT_ACCESSIBLE rather than DRIVE_API_ERROR.
+  // Folder-level failures are usually 404/403 — surface as FOLDER_NOT_ACCESSIBLE.
   const code = _isAccessError_(r.error)
     ? 'FOLDER_NOT_ACCESSIBLE'
     : 'DRIVE_API_ERROR';
@@ -383,9 +295,8 @@ function _openFolderWithRetry_(folderId) {
 
 /**
  * Runs a Drive list operation with bounded retry.
- *
- * @param {function(): Object[]} fn - The list operation to run.
- * @param {string} label - Human-readable name for diagnostics.
+ * @param {function(): Object[]} fn
+ * @param {string} label
  * @returns {{ok: boolean, value: ?Object[], code: string, message: ?string, attempts: number}}
  * @private
  */
@@ -399,11 +310,9 @@ function _listWithRetry_(fn, label) {
 }
 
 /**
- * Runs a Drive removal operation (removeEditor / removeViewer) with
- * bounded retry.
- *
- * @param {function(): void} fn - The removal operation.
- * @param {string} label - Human-readable name for diagnostics.
+ * Runs a Drive removal operation (removeEditor/removeViewer) with bounded retry.
+ * @param {function(): void} fn
+ * @param {string} label
  * @returns {{ok: boolean, code: string, message: ?string, attempts: number}}
  * @private
  */
@@ -412,20 +321,14 @@ function _removeWithRetry_(fn, label) {
   if (r.ok) {
     return { ok: true, code: '', message: null, attempts: r.attempts };
   }
-  // Removal can fail for access reasons (rare — we just listed the
-  // editors successfully) or for transient reasons. Treat access
-  // failures as DRIVE_API_ERROR here, since FOLDER_NOT_ACCESSIBLE
-  // is reserved for "we couldn't even see the folder".
   return { ok: false, code: 'DRIVE_API_ERROR', message: r.message, attempts: r.attempts };
 }
 
 /**
- * Core retry wrapper. Runs `fn` up to DRIVE_MAX_RETRIES + 1 times,
- * retrying only on transient errors (rate limits, 5xx, timeouts).
- * Non-transient errors break the loop immediately.
- *
+ * Core retry wrapper. Runs `fn` up to DRIVE_MAX_RETRIES + 1 times, retrying
+ * only on transient errors. Non-transient errors break immediately.
  * @param {function(): *} fn
- * @param {string} label - Used only to build a useful error message.
+ * @param {string} label - For error message only.
  * @returns {{ok: boolean, value: ?, error: ?Object, message: ?string, attempts: number}}
  * @private
  */
@@ -467,7 +370,7 @@ function _findUserByEmail_(users, email) {
       const candidate = String(users[i].getEmail() || '').trim().toLowerCase();
       if (candidate === email) return users[i];
     } catch (e) {
-      // A user without a resolvable email is skipped silently.
+      // Skip users without a resolvable email.
     }
   }
   return null;
@@ -479,10 +382,9 @@ function _findUserByEmail_(users, email) {
 
 /**
  * Builds a RevocationResult.
- *
  * @param {?string} folderId
  * @param {string} internEmail
- * @param {string} action - Outcome code (DataDictionary §4.7).
+ * @param {string} action - Outcome code.
  * @param {'success'|'failure'} outcome
  * @param {?string} errorMessage
  * @param {number} attempts - Drive API calls made.
@@ -502,10 +404,7 @@ function _result_(folderId, internEmail, action, outcome, errorMessage, attempts
 
 /**
  * Builds the idempotent "no permission found" result. Escalates to
- * ALREADY_REVOKED_PROVISIONED when `trackingStatus` is 'Access Shared',
- * indicating the system expected a permission to exist but none was
- * found — a state worth flagging at WARN for follow-up.
- *
+ * ALREADY_REVOKED_PROVISIONED when `trackingStatus` is 'Access Shared'.
  * @param {string} folderId
  * @param {string} email
  * @param {?string} trackingStatus
@@ -527,9 +426,7 @@ function _alreadyRevokedResult_(folderId, email, trackingStatus, attempts) {
 // =============================================================================
 
 /**
- * True when an error indicates the running user cannot see the folder
- * or the folder does not exist (HTTP 403 / 404 equivalents).
- *
+ * True when an error indicates the folder is missing or unreadable (403/404).
  * @param {*} e
  * @returns {boolean}
  * @private
@@ -547,9 +444,7 @@ function _isAccessError_(e) {
 }
 
 /**
- * True when an error is likely transient and worth retrying:
- * rate-limit (429), server errors (5xx), timeouts.
- *
+ * True when an error is likely transient: rate-limit (429), 5xx, timeouts.
  * @param {*} e
  * @returns {boolean}
  * @private
@@ -594,9 +489,8 @@ function _errorMessage_(e) {
  * @typedef {Object} RevocationResult
  * @property {?string} folderId       Resolved folder ID; null on resolution failure.
  * @property {string} internEmail     Email processed (canonical form when resolvable).
- * @property {string} action          Outcome code; one of the values listed in the
- *                                    file-level docstring (DataDictionary §4.7).
+ * @property {string} action          Outcome code (see file-level docstring).
  * @property {'success'|'failure'} outcome Whether the action completed without error.
  * @property {?string} errorMessage   Human-readable detail; null on clean success.
- * @property {number} attempts        Total Drive API calls made (for quota diagnostics).
+ * @property {number} attempts        Total Drive API calls made (quota diagnostics).
  */
